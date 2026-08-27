@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import holidays as holidays_lib
 from datetime import datetime
-from solver_v2 import solve_schedule
+from solver import solve_schedule
 from ical_generator import write_ics_files, expand_blockout_periods
 
 st.set_page_config(page_title="UKM Pharmacy Scheduler", layout="wide")
