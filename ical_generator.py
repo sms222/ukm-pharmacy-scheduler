@@ -80,11 +80,12 @@ def _weekly_occurrences(start_date, end_date, weekday):
         d += timedelta(weeks=1)
 
 
-def generate_events(assignments, holidays=None):
+def generate_events(assignments, holidays=None, venue_blockouts=None):
     """Expand each solver assignment into individual dated events, skipping
-    exception dates and holiday dates. Returns (event_records, flags) where
-    flags lists any exception entries that need a human look (moved sessions)."""
+    exception dates, global holidays, and venue-specific blockout dates.
+    venue_blockouts: dict of {venue_id: set_of_ISO_dates}."""
     holidays = set(holidays or [])
+    venue_blockouts = venue_blockouts or {}
     event_records = []
     flags = []
 
@@ -92,6 +93,7 @@ def generate_events(assignments, holidays=None):
         weekday = DAY_TO_WEEKDAY[a["day"]]
         skip_dates, needs_review = _parse_exceptions(a.get("exceptions"))
         flags.extend(f"{a['course_code']}: {x}" for x in needs_review)
+        venue_skip = venue_blockouts.get(a["venue"], set())
 
         start_slot = a["slots"][0]
         end_slot = a["slots"][-1]
@@ -100,7 +102,7 @@ def generate_events(assignments, holidays=None):
 
         for occ_date in _weekly_occurrences(a["start_date"], a["end_date"], weekday):
             iso = occ_date.isoformat()
-            if iso in skip_dates or iso in holidays:
+            if iso in skip_dates or iso in holidays or iso in venue_skip:
                 continue
             ev = Event()
             group_suffix = f" (Grp {a['group']})" if a.get("group") else ""
@@ -115,10 +117,10 @@ def generate_events(assignments, holidays=None):
     return event_records, flags
 
 
-def write_ics_files(assignments, holidays=None, out_dir="."):
+def write_ics_files(assignments, holidays=None, venue_blockouts=None, out_dir="."):
     """Writes one .ics per cohort and one per lecturer. Returns
     (list_of_file_paths, flags_needing_manual_review)."""
-    event_records, flags = generate_events(assignments, holidays)
+    event_records, flags = generate_events(assignments, holidays, venue_blockouts)
 
     by_cohort = {}
     by_lecturer = {}

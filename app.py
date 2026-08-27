@@ -24,13 +24,19 @@ tabs = st.tabs([
 # ---------------------------------------------------------------- Semester
 with tab_sem:
     st.header("Semester Settings")
-    st.write("This is the calendar boundary — every course session must fall within it.")
-    col1, col2 = st.columns(2)
+    st.write("This is the calendar boundary — every course session must fall within it, unless a course overrides its own dates.")
+    col1, col2, col3 = st.columns(3)
     with col1:
-        sem_start = st.date_input("Semester Start", value=datetime(2025, 9, 1))
+        sem_start = st.date_input("Semester Start", value=datetime(2026, 9, 1))
     with col2:
-        sem_end = st.date_input("Semester End", value=datetime(2026, 1, 31))
-    semester = {"start": sem_start.isoformat(), "end": sem_end.isoformat()}
+        sem_end = st.date_input("Semester End", value=datetime(2027, 1, 31))
+    with col3:
+        sem_number = st.selectbox("Semester", ["Semester 1", "Semester 2"])
+    academic_year = st.text_input("Academic Year (e.g. 2026/2027)", value="2026/2027")
+    semester = {
+        "start": sem_start.isoformat(), "end": sem_end.isoformat(),
+        "label": f"{sem_number} {academic_year}",
+    }
     st.session_state["semester"] = semester
 
 # ---------------------------------------------------------------- Session Types
@@ -46,24 +52,48 @@ with tab_types:
 # ---------------------------------------------------------------- Venues
 with tab_venues:
     st.header("Venue Constraints")
-    st.write("Define rooms, capacities, availability, and which session types each room accepts.")
+    st.write("Define rooms, capacities, and which session types each room accepts.")
     venues_df = pd.DataFrame({
         "Room ID": ["DK1", "DK4", "BSH3", "MAF"],
         "Capacity": [200, 150, 60, 70],
-        "Availability": ["All Day", "AM Only", "PM Preferred", "All Day"],
         "Allowed Session Types": ["Lecture,Workshop", "Lecture,Quiz", "Workshop,Quiz", "Lab,Quiz"],
     })
-    venues_df = st.data_editor(
-        venues_df, num_rows="dynamic", key="venues",
-        column_config={
-            "Availability": st.column_config.SelectboxColumn(
-                options=["All Day", "AM Only", "PM Only", "Custom"]
-            ),
-        },
-    )
+    venues_df = st.data_editor(venues_df, num_rows="dynamic", key="venues")
     st.caption(
         "Allowed Session Types: comma-separated, must match names in the Session Types tab "
         f"({', '.join(sorted(valid_types))})."
+    )
+
+    st.subheader("Venue Availability Windows")
+    st.write(
+        "A room with NO rows here is treated as fully available, any day, any time (default). "
+        "Add rows only for rooms with real restrictions — a room can have several windows "
+        "(e.g. DK4: Mon-Thu 08:00-12:00, PLUS Fri 08:00-10:00)."
+    )
+    if "venue_availability" not in st.session_state:
+        st.session_state["venue_availability"] = pd.DataFrame({
+            "Room ID": ["DK4", "DK4", "DK4", "DK4"],
+            "Day": ["Mon", "Tue", "Wed", "Thu"],
+            "Start Time": ["08:00"] * 4,
+            "End Time": ["12:00"] * 4,
+        })
+    availability_df = st.data_editor(
+        st.session_state["venue_availability"], num_rows="dynamic", key="venue_availability_editor",
+        column_config={
+            "Day": st.column_config.SelectboxColumn(options=["All", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]),
+        },
+    )
+    st.session_state["venue_availability"] = availability_df
+    st.caption("Day = 'All' applies that time window every day. Start/End Time format HH:MM (24-hour).")
+
+    st.subheader("Venue Block Out Periods")
+    st.write("Room-specific closures — renovation, maintenance, etc. Supports multi-day ranges.")
+    if "venue_blockout_periods" not in st.session_state:
+        st.session_state["venue_blockout_periods"] = pd.DataFrame({
+            "Room ID": [], "Start Date": [], "End Date": [],
+        })
+    st.session_state["venue_blockout_periods"] = st.data_editor(
+        st.session_state["venue_blockout_periods"], num_rows="dynamic", key="venue_blockout_editor"
     )
 
 # ---------------------------------------------------------------- Lecturers
@@ -95,7 +125,12 @@ with tab_lect:
             "DIFFERENT people and won't catch a double-booking between them:\n\n"
             + dupes[["Lecturer ID", "Lecturer Name"]].to_string(index=False)
         )
-    st.caption("Recurring Blackout: day name(s) e.g. 'Friday'. One-off dates: comma-separated YYYY-MM-DD.")
+    st.caption(
+        "Recurring Blackout: 'Friday' blocks the whole day every week. "
+        "'Thu 14:00-17:00' blocks only that time window every week. "
+        "Multiple entries: separate with semicolons, e.g. 'Friday; Thu 14:00-17:00'. "
+        "One-off dates: comma-separated YYYY-MM-DD (blocks the whole day on that specific date)."
+    )
 
 # ---------------------------------------------------------------- Cohorts
 with tab_cohort:
@@ -110,6 +145,62 @@ with tab_cohort:
 with tab_courses:
     st.header("Courses — enter by course, session by session")
     st.write("Pick a course code (or create one), then define its sessions below.")
+
+    st.subheader("Bulk import")
+    uploaded_file = st.file_uploader(
+        "Upload a Course Sessions file (.csv or .xlsx) — from the extractor or the template",
+        type=["csv", "xlsx"],
+    )
+    REQUIRED_COLS = [
+        "Course Code", "Session ID", "Session Type", "Cohort ID", "Lecturer ID",
+        "Duration (Hrs)", "Start Date", "End Date", "Requires Group Split",
+        "Number of Groups", "Depends On", "Chronology", "Position Rule",
+        "Fixed Day", "Fixed Time",
+    ]
+    if uploaded_file is not None:
+        try:
+            if uploaded_file.name.endswith(".csv"):
+                incoming_df = pd.read_csv(uploaded_file, dtype=str)
+            else:
+                incoming_df = pd.read_excel(uploaded_file, sheet_name=0, dtype=str)
+        except Exception as e:
+            st.error(f"Could not read that file: {e}")
+            incoming_df = None
+
+        if incoming_df is not None:
+            missing = [c for c in REQUIRED_COLS if c not in incoming_df.columns]
+            if missing:
+                st.error(f"Missing required column(s): {', '.join(missing)} — check against the template's headers.")
+            else:
+                incoming_df["Requires Group Split"] = (
+                    incoming_df["Requires Group Split"].astype(str).str.upper().map(
+                        {"TRUE": True, "FALSE": False, "1": True, "0": False}
+                    ).fillna(False)
+                )
+                incoming_df["Number of Groups"] = pd.to_numeric(incoming_df["Number of Groups"], errors="coerce").fillna(1).astype(int)
+                incoming_df["Duration (Hrs)"] = pd.to_numeric(incoming_df["Duration (Hrs)"], errors="coerce")
+                for col in ["Depends On", "Fixed Day", "Fixed Time", "Position Rule"]:
+                    incoming_df[col] = incoming_df[col].fillna("")
+
+                st.write(f"Found {len(incoming_df)} session row(s) across {incoming_df['Course Code'].nunique()} course(s):")
+                st.dataframe(incoming_df)
+
+                mode = st.radio("How should this be applied?", ["Add to existing courses", "Replace all existing courses"])
+                if st.button("Confirm import"):
+                    if "course_sessions" not in st.session_state:
+                        st.session_state["course_sessions"] = pd.DataFrame({col: [] for col in REQUIRED_COLS})
+                    if mode == "Replace all existing courses":
+                        st.session_state["course_sessions"] = incoming_df[REQUIRED_COLS]
+                    else:
+                        existing = st.session_state["course_sessions"]
+                        codes_incoming = set(incoming_df["Course Code"])
+                        st.session_state["course_sessions"] = pd.concat(
+                            [existing[~existing["Course Code"].isin(codes_incoming)], incoming_df[REQUIRED_COLS]],
+                            ignore_index=True,
+                        )
+                    st.success("Imported. Scroll down to review/edit individual courses.")
+
+    st.divider()
 
     if "course_sessions" not in st.session_state:
         st.session_state["course_sessions"] = pd.DataFrame({
@@ -162,7 +253,8 @@ with tab_courses:
     st.caption(
         "Depends On: another Session ID within this SAME course that must come first. "
         "Position Rule only applies when Chronology = Flexible. "
-        "Fixed Day/Time only applies when Chronology = Fixed."
+        "Fixed Day/Time only applies when Chronology = Fixed. "
+        "Start/End Date: leave blank to use the Semester Settings dates by default."
     )
     with st.expander("View all courses (read-only)"):
         st.dataframe(st.session_state["course_sessions"])
@@ -221,7 +313,7 @@ with tab_gen:
     if st.button("Run OR-Tools Solver", type="primary"):
         try:
             result = solve_schedule(
-                venues_df, lec_df, cohort_df, course_df, st.session_state["semester"]
+                venues_df, availability_df, lec_df, cohort_df, course_df, st.session_state["semester"]
             )
         except ValueError as e:
             st.error(f"Could not build a schedule: {e}")
@@ -241,8 +333,17 @@ with tab_gen:
         if st.button("📥 Generate .ics Feeds (per cohort & lecturer)"):
             blockout_dates = set(st.session_state["ph_df"]["Date"].dropna().tolist())
             blockout_dates |= expand_blockout_periods(st.session_state["blockout_periods"])
+
+            venue_blockouts = {}
+            for _, row in st.session_state["venue_blockout_periods"].iterrows():
+                if not row.get("Room ID") or not row.get("Start Date") or not row.get("End Date"):
+                    continue
+                one_room_df = pd.DataFrame([row])
+                venue_blockouts.setdefault(row["Room ID"], set()).update(expand_blockout_periods(one_room_df))
+
             written, flags = write_ics_files(
-                st.session_state["assignments"], holidays=blockout_dates, out_dir="/tmp"
+                st.session_state["assignments"], holidays=blockout_dates,
+                venue_blockouts=venue_blockouts, out_dir="/tmp"
             )
             st.success(f"Generated {len(written)} .ics files ({len(blockout_dates)} block-out dates applied).")
             if flags:

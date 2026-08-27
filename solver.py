@@ -53,7 +53,22 @@ DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
 DAY_INDEX = {d: i for i, d in enumerate(DAYS)}
 SLOT_ORDER = ["AM1", "AM2", "PM1", "PM2"]
 SLOT_TIMES = {"AM1": (8, 0), "AM2": (10, 0), "PM1": (14, 0), "PM2": (16, 0)}
+SLOT_RANGES_MIN = {  # (start_minute, end_minute) from midnight, for overlap checks
+    "AM1": (8 * 60, 10 * 60), "AM2": (10 * 60, 12 * 60),
+    "PM1": (14 * 60, 16 * 60), "PM2": (16 * 60, 18 * 60),
+}
 FRIDAY_SLOTS = ["AM1", "PM2"]  # protects the 12:00-14:00 prayer window
+
+
+def _slot_group_range_min(slot_group):
+    start = SLOT_RANGES_MIN[slot_group[0]][0]
+    end = SLOT_RANGES_MIN[slot_group[-1]][1]
+    return start, end
+
+
+def _parse_hhmm(s):
+    h, m = s.strip().split(":")
+    return int(h) * 60 + int(m)
 
 
 def _slots_for_day(day):
@@ -72,18 +87,78 @@ def _consecutive_slot_groups(day, n_slots):
 
 
 def _expand_lecturer_blackout(row):
-    recurring = set()
+    """Recurring Blackout supports two entry styles, semicolon-separated:
+       'Friday'              -> full-day blackout every Friday
+       'Thu 14:00-17:00'     -> only that time window blocked, every Thursday
+    Returns (full_day_set, timed_list[(day, start_min, end_min)], one_off_dates)."""
+    full_day = set()
+    timed = []
     val = row.get("Recurring Blackout")
     if isinstance(val, str) and val.strip():
-        for d in val.split(","):
-            d = d.strip()[:3].title()
-            if d in DAYS:
-                recurring.add(d)
+        for entry in val.split(";"):
+            entry = entry.strip()
+            if not entry:
+                continue
+            parts = entry.split(None, 1)
+            day = parts[0][:3].title()
+            if day not in DAYS:
+                continue
+            if len(parts) == 1:
+                full_day.add(day)
+            else:
+                try:
+                    start_s, end_s = parts[1].split("-")
+                    timed.append((day, _parse_hhmm(start_s), _parse_hhmm(end_s)))
+                except ValueError:
+                    full_day.add(day)  # malformed time -> fail safe to full-day block
+
     one_off = set()
     val2 = row.get("One-off Blackout Dates")
     if isinstance(val2, str) and val2.strip():
         one_off = {d.strip() for d in val2.split(",")}
-    return recurring, one_off
+    return full_day, timed, one_off
+
+
+def _venue_windows(availability_df):
+    """Room ID -> list of (day_or_None_for_'All', start_min, end_min).
+    A room with NO rows here is treated as available all day, every day
+    (backward compatible with rooms nobody has restricted yet)."""
+    windows = defaultdict(list)
+    if availability_df is None or availability_df.empty:
+        return windows
+    for _, row in availability_df.iterrows():
+        room = row["Room ID"]
+        day = row.get("Day")
+        day = None if (not day or str(day).strip().lower() == "all") else str(day).strip()[:3].title()
+        try:
+            start_min = _parse_hhmm(str(row["Start Time"]))
+            end_min = _parse_hhmm(str(row["End Time"]))
+        except Exception:
+            continue
+        windows[room].append((day, start_min, end_min))
+    return windows
+
+
+def _venue_available(room, day, slot_group, windows):
+    if room not in windows or not windows[room]:
+        return True  # no restrictions defined -> fully available
+    g_start, g_end = _slot_group_range_min(slot_group)
+    for w_day, w_start, w_end in windows[room]:
+        if w_day is not None and w_day != day:
+            continue
+        if w_start <= g_start and g_end <= w_end:
+            return True
+    return False
+
+
+def _venue_blocked_by_lecturer_time(day, slot_group, timed_blackouts):
+    g_start, g_end = _slot_group_range_min(slot_group)
+    for b_day, b_start, b_end in timed_blackouts:
+        if b_day != day:
+            continue
+        if g_start < b_end and g_end > b_start:  # overlap
+            return True
+    return False
 
 
 def _check_semester_bounds(courses_df, semester):
@@ -91,6 +166,8 @@ def _check_semester_bounds(courses_df, semester):
     sem_end = datetime.strptime(semester["end"], "%Y-%m-%d").date()
     problems = []
     for _, c in courses_df.iterrows():
+        if not c.get("Start Date") or not c.get("End Date"):
+            continue  # blank -> will default to semester bounds, always valid
         cs = datetime.strptime(c["Start Date"], "%Y-%m-%d").date()
         ce = datetime.strptime(c["End Date"], "%Y-%m-%d").date()
         if cs < sem_start or ce > sem_end:
@@ -102,9 +179,10 @@ def _check_semester_bounds(courses_df, semester):
     return problems
 
 
-def build_sessions(courses_df, cohorts_df):
+def build_sessions(courses_df, cohorts_df, semester):
     """Expand each course-session row into one or more instances
-    (handles per-session group splitting)."""
+    (handles per-session group splitting). Blank Start/End Date fall back
+    to the Semester Settings bounds."""
     cohort_size = dict(zip(cohorts_df["Cohort ID"], cohorts_df["Total Students"]))
 
     sessions = []
@@ -116,6 +194,8 @@ def build_sessions(courses_df, cohorts_df):
         groups = [f"Group {i+1}" for i in range(n_groups)] if split and n_groups > 1 else [None]
 
         chronology = c.get("Chronology", "Flexible")
+        start_date = c.get("Start Date") or semester["start"]
+        end_date = c.get("End Date") or semester["end"]
         for g in groups:
             sessions.append({
                 "session_id": c["Session ID"],
@@ -125,8 +205,8 @@ def build_sessions(courses_df, cohorts_df):
                 "lecturer": c["Lecturer ID"],
                 "session_type": c["Session Type"],
                 "duration_hrs": c["Duration (Hrs)"],
-                "start_date": c["Start Date"],
-                "end_date": c["End Date"],
+                "start_date": start_date,
+                "end_date": end_date,
                 "depends_on": c.get("Depends On") or None,
                 "chronology": chronology,
                 "position_rule": c.get("Position Rule", "None") if chronology == "Flexible" else "None",
@@ -137,7 +217,7 @@ def build_sessions(courses_df, cohorts_df):
     return sessions
 
 
-def solve_schedule(venues_df, lecturers_df, cohorts_df, courses_df, semester):
+def solve_schedule(venues_df, availability_df, lecturers_df, cohorts_df, courses_df, semester):
     bound_problems = _check_semester_bounds(courses_df, semester)
     if bound_problems:
         raise ValueError(
@@ -145,7 +225,7 @@ def solve_schedule(venues_df, lecturers_df, cohorts_df, courses_df, semester):
         )
 
     model = cp_model.CpModel()
-    sessions = build_sessions(courses_df, cohorts_df)
+    sessions = build_sessions(courses_df, cohorts_df, semester)
 
     lecturer_blackout = {
         row["Lecturer ID"]: _expand_lecturer_blackout(row)
@@ -157,6 +237,7 @@ def solve_schedule(venues_df, lecturers_df, cohorts_df, courses_df, semester):
             "capacity": row["Capacity"],
             "types": {t.strip() for t in str(row["Allowed Session Types"]).split(",")},
         }
+    venue_windows = _venue_windows(availability_df)
 
     # --- Candidate (day, slot_group, venue) options per session ---
     session_options = {}
@@ -167,22 +248,26 @@ def solve_schedule(venues_df, lecturers_df, cohorts_df, courses_df, semester):
         for day in candidate_days:
             if day is None:
                 continue
-            recurring_bo, _ = lecturer_blackout.get(s["lecturer"], (set(), set()))
-            if day in recurring_bo:
+            full_day_bo, timed_bo, _ = lecturer_blackout.get(s["lecturer"], (set(), [], set()))
+            if day in full_day_bo:
                 continue
             for slot_group in _consecutive_slot_groups(day, n_slots):
                 if s["fixed_time"] and slot_group[0] != s["fixed_time"]:
+                    continue
+                if _venue_blocked_by_lecturer_time(day, slot_group, timed_bo):
                     continue
                 for room, info in venue_info.items():
                     if info["capacity"] < s["size"]:
                         continue
                     if s["session_type"] not in info["types"]:
                         continue
+                    if not _venue_available(room, day, slot_group, venue_windows):
+                        continue
                     options.append((day, tuple(slot_group), room))
         if not options:
             raise ValueError(
                 f"No feasible slot/venue for {s['course_code']} / {s['session_id']} "
-                f"(group {s['group']}) -- check capacity/room-type/blackout/fixed-slot data."
+                f"(group {s['group']}) -- check capacity/room-type/blackout/availability/fixed-slot data."
             )
         session_options[idx] = options
 
