@@ -55,6 +55,21 @@ def _parse_exceptions(exceptions_str):
     return skip_dates, needs_review
 
 
+def expand_blockout_periods(periods_df):
+    """Turns a (Name, Start Date, End Date) table -- e.g. Convocation week,
+    Mesyuarat Fakulti -- into a flat set of individual ISO date strings."""
+    dates = set()
+    for _, row in periods_df.iterrows():
+        if not row.get("Start Date") or not row.get("End Date"):
+            continue
+        d = _parse_date(row["Start Date"])
+        end = _parse_date(row["End Date"])
+        while d <= end:
+            dates.add(d.isoformat())
+            d += timedelta(days=1)
+    return dates
+
+
 def _weekly_occurrences(start_date, end_date, weekday):
     d = _parse_date(start_date)
     end = _parse_date(end_date)

@@ -1,42 +1,58 @@
 """
-UKM Pharmacy Scheduler - CP-SAT Solver Core
-Step 1 of the build: solver logic only. iCal generation and manual
-drag-and-drop overrides are separate steps, not covered here.
+UKM Pharmacy Scheduler - CP-SAT Solver Core (v2)
 
-DESIGN ASSUMPTIONS -- confirm these before I build Step 2 on top:
+SCHEMA THIS VERSION EXPECTS
+----------------------------
+semester: {"start": "YYYY-MM-DD", "end": "YYYY-MM-DD"}
 
-1. Each course is assigned ONE weekly recurring (day, timeslot, venue)
-   pattern for its whole Start Date -> End Date block. Individual date
-   exceptions and public holidays are NOT solved here -- they are applied
-   later, when generating the iCal feed, as "recurring pattern minus these
-   specific dates". This keeps the search fast and matches how a real
-   semester timetable actually runs (you don't re-decide the room every week).
+venues_df columns:
+    Room ID, Capacity, Availability (All Day/AM Only/PM Only/Custom),
+    Custom Start, Custom End (only used if Availability == "Custom"),
+    Allowed Session Types (comma-separated, matched against Session Type)
 
-2. Timeslots are fixed 2-hour blocks:
-      AM1 08:00-10:00   AM2 10:00-12:00   PM1 14:00-16:00   PM2 16:00-18:00
-   Friday only offers AM1 and PM2 -- the 12:00-14:00 gap is permanently
-   reserved for Friday prayers and is never offered as a candidate slot.
-   A course needing more than 2 hours consumes multiple CONSECUTIVE slots
-   on the same day (e.g. a 4-hr lab = AM1+AM2).
+lecturers_df columns:
+    Lecturer ID, Lecturer Name, Recurring Blackout, One-off Blackout Dates
 
-3. "Fixed" courses (Fixed Day + Fixed Time both set) skip the day search --
-   the solver only checks that pinned slot doesn't break a hard constraint
-   (double-booking, capacity, blackout). If it does, the model reports
-   infeasible rather than silently moving it.
+cohorts_df columns:
+    Cohort ID, Total Students
 
-4. A cohort marked "Needs Lab Split" produces two independent
-   session-instances (Group A / Group B) for its Lab-type courses, each
-   sized at ceil(total_students / 2). The two groups are explicitly
-   ALLOWED to run in parallel (different venues, same or different time) --
-   only a genuinely different course clashing with the cohort is blocked.
+courses_df columns (one row PER SESSION, grouped by Course Code):
+    Course Code, Session ID, Session Type, Cohort ID, Lecturer ID,
+    Duration (Hrs), Start Date, End Date,
+    Requires Group Split, Number of Groups,
+    Depends On (a Session ID, optional),
+    Chronology ("Fixed" or "Flexible"),
+    Position Rule ("None"/"Must be first"/"Must be last"/
+                    "Cannot be first"/"Cannot be last") -- only read if Flexible,
+    Fixed Day, Fixed Time (only read if Chronology == "Fixed")
+
+DESIGN ASSUMPTIONS (unchanged from v1, still true)
+----------------------------------------------------
+1. Each session gets ONE weekly recurring (day, timeslot, venue) pattern for
+   its Start Date -> End Date block. Public holidays and one-off exceptions
+   are applied later, at iCal generation, as "recurring pattern minus these
+   dates" -- not solved here.
+2. Timeslots are fixed 2-hour blocks: AM1 08-10, AM2 10-12, PM1 14-16, PM2 16-18.
+   Friday only offers AM1 and PM2 (12:00-14:00 permanently reserved for
+   Friday prayers, never offered as a candidate).
+3. "Fixed" sessions (Chronology == Fixed, with Fixed Day + Fixed Time set)
+   skip the day/time search -- the solver only validates the pinned slot
+   against the other hard constraints.
+4. "Position Rule" (Must/Cannot be first/last) is evaluated PER COURSE, among
+   that course's own sessions, per week -- e.g. a quiz that can't be the
+   earliest session of NFNF1713 that week, regardless of which day the
+   lecture lands on.
 """
 
 import math
 from collections import defaultdict
+from datetime import datetime
 from ortools.sat.python import cp_model
 
 DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"]
+DAY_INDEX = {d: i for i, d in enumerate(DAYS)}
 SLOT_ORDER = ["AM1", "AM2", "PM1", "PM2"]
+SLOT_TIMES = {"AM1": (8, 0), "AM2": (10, 0), "PM1": (14, 0), "PM2": (16, 0)}
 FRIDAY_SLOTS = ["AM1", "PM2"]  # protects the 12:00-14:00 prayer window
 
 
@@ -45,7 +61,6 @@ def _slots_for_day(day):
 
 
 def _consecutive_slot_groups(day, n_slots):
-    """All valid contiguous slot windows of length n_slots for a given day."""
     avail = _slots_for_day(day)
     groups = []
     for i in range(len(avail) - n_slots + 1):
@@ -71,40 +86,64 @@ def _expand_lecturer_blackout(row):
     return recurring, one_off
 
 
+def _check_semester_bounds(courses_df, semester):
+    sem_start = datetime.strptime(semester["start"], "%Y-%m-%d").date()
+    sem_end = datetime.strptime(semester["end"], "%Y-%m-%d").date()
+    problems = []
+    for _, c in courses_df.iterrows():
+        cs = datetime.strptime(c["Start Date"], "%Y-%m-%d").date()
+        ce = datetime.strptime(c["End Date"], "%Y-%m-%d").date()
+        if cs < sem_start or ce > sem_end:
+            problems.append(
+                f"{c['Course Code']} / {c['Session ID']}: "
+                f"{c['Start Date']} to {c['End Date']} falls outside "
+                f"semester bounds {semester['start']} to {semester['end']}"
+            )
+    return problems
+
+
 def build_sessions(courses_df, cohorts_df):
-    """Expand each course row into one or more session-instances
-    (handles lab-group splitting)."""
+    """Expand each course-session row into one or more instances
+    (handles per-session group splitting)."""
     cohort_size = dict(zip(cohorts_df["Cohort ID"], cohorts_df["Total Students"]))
-    needs_split = dict(zip(cohorts_df["Cohort ID"], cohorts_df["Needs Lab Split?"]))
 
     sessions = []
     for _, c in courses_df.iterrows():
         cohort = c["Cohort ID"]
         size = cohort_size.get(cohort, 0)
-        split = bool(needs_split.get(cohort, False)) and c["Session Type"] == "Lab"
-        groups = ["A", "B"] if split else [None]
+        split = bool(c.get("Requires Group Split", False))
+        n_groups = int(c["Number of Groups"]) if split and c.get("Number of Groups") else 1
+        groups = [f"Group {i+1}" for i in range(n_groups)] if split and n_groups > 1 else [None]
 
+        chronology = c.get("Chronology", "Flexible")
         for g in groups:
             sessions.append({
+                "session_id": c["Session ID"],
                 "course_code": c["Course Code"],
                 "group": g,
                 "cohort": cohort,
                 "lecturer": c["Lecturer ID"],
                 "session_type": c["Session Type"],
                 "duration_hrs": c["Duration (Hrs)"],
-                "room_type": c["Required Room Type"],
-                "start_date": c.get("Start Date"),
-                "end_date": c.get("End Date"),
+                "start_date": c["Start Date"],
+                "end_date": c["End Date"],
                 "depends_on": c.get("Depends On") or None,
-                "fixed_day": c.get("Fixed Day") or None,
-                "fixed_time": c.get("Fixed Time") or None,
-                "exceptions": c.get("Exceptions") or None,
-                "size": math.ceil(size / 2) if split else size,
+                "chronology": chronology,
+                "position_rule": c.get("Position Rule", "None") if chronology == "Flexible" else "None",
+                "fixed_day": c.get("Fixed Day") or None if chronology == "Fixed" else None,
+                "fixed_time": c.get("Fixed Time") or None if chronology == "Fixed" else None,
+                "size": math.ceil(size / n_groups) if split and n_groups > 1 else size,
             })
     return sessions
 
 
-def solve_schedule(venues_df, lecturers_df, cohorts_df, courses_df):
+def solve_schedule(venues_df, lecturers_df, cohorts_df, courses_df, semester):
+    bound_problems = _check_semester_bounds(courses_df, semester)
+    if bound_problems:
+        raise ValueError(
+            "These sessions fall outside the semester dates:\n" + "\n".join(bound_problems)
+        )
+
     model = cp_model.CpModel()
     sessions = build_sessions(courses_df, cohorts_df)
 
@@ -112,15 +151,14 @@ def solve_schedule(venues_df, lecturers_df, cohorts_df, courses_df):
         row["Lecturer ID"]: _expand_lecturer_blackout(row)
         for _, row in lecturers_df.iterrows()
     }
-    venue_info = {
-        row["Room ID"]: {
+    venue_info = {}
+    for _, row in venues_df.iterrows():
+        venue_info[row["Room ID"]] = {
             "capacity": row["Capacity"],
             "types": {t.strip() for t in str(row["Allowed Session Types"]).split(",")},
         }
-        for _, row in venues_df.iterrows()
-    }
 
-    # --- Build candidate (day, slot_group, venue) options per session ---
+    # --- Candidate (day, slot_group, venue) options per session ---
     session_options = {}
     for idx, s in enumerate(sessions):
         n_slots = max(1, math.ceil(s["duration_hrs"] / 2))
@@ -143,8 +181,8 @@ def solve_schedule(venues_df, lecturers_df, cohorts_df, courses_df):
                     options.append((day, tuple(slot_group), room))
         if not options:
             raise ValueError(
-                f"No feasible slot/venue for {s['course_code']} "
-                f"(group {s['group']}) -- check capacity/room-type/blackout data."
+                f"No feasible slot/venue for {s['course_code']} / {s['session_id']} "
+                f"(group {s['group']}) -- check capacity/room-type/blackout/fixed-slot data."
             )
         session_options[idx] = options
 
@@ -154,6 +192,15 @@ def solve_schedule(venues_df, lecturers_df, cohorts_df, courses_df):
         for opt_i in range(len(options)):
             choice[(idx, opt_i)] = model.NewBoolVar(f"s{idx}_o{opt_i}")
         model.Add(sum(choice[(idx, o)] for o in range(len(options))) == 1)
+
+    # --- Day-index integer variable per session (for position-rule constraints) ---
+    day_idx_var = {}
+    for idx, options in session_options.items():
+        var = model.NewIntVar(0, len(DAYS) - 1, f"day_idx_{idx}")
+        model.Add(var == sum(
+            DAY_INDEX[options[o][0]] * choice[(idx, o)] for o in range(len(options))
+        ))
+        day_idx_var[idx] = var
 
     # --- No double-booking: venue / lecturer / cohort, per (day, slot) ---
     day_slot_usage = defaultdict(list)
@@ -169,34 +216,63 @@ def solve_schedule(venues_df, lecturers_df, cohorts_df, courses_df):
         for idx, opt_i, room in entries:
             by_room[room].append(choice[(idx, opt_i)])
             by_lecturer[sessions[idx]["lecturer"]].append(choice[(idx, opt_i)])
-            by_cohort[sessions[idx]["cohort"]].append((choice[(idx, opt_i)], sessions[idx]["course_code"]))
+            by_cohort[sessions[idx]["cohort"]].append((choice[(idx, opt_i)], sessions[idx]["course_code"], sessions[idx]["group"]))
 
         for vars_ in by_room.values():
             model.Add(sum(vars_) <= 1)
         for vars_ in by_lecturer.values():
             model.Add(sum(vars_) <= 1)
-        for pairs in by_cohort.values():
-            # same-course parallel groups (A/B) may overlap; different courses may not
-            if len(set(p[1] for p in pairs)) > 1:
-                model.Add(sum(v for v, _ in pairs) <= 1)
+        for triples in by_cohort.values():
+            # same-course parallel groups are allowed to overlap; different courses may not
+            courses_here = set(t[1] for t in triples)
+            if len(courses_here) > 1:
+                model.Add(sum(v for v, _, _ in triples) <= 1)
 
-    # --- Sequencing: dependent course must be on a later weekday ---
-    code_to_idx = defaultdict(list)
+    # --- Sequencing: depends_on session must be on an earlier weekday ---
+    id_to_idx = defaultdict(list)
     for idx, s in enumerate(sessions):
-        code_to_idx[s["course_code"]].append(idx)
-    day_index = {d: i for i, d in enumerate(DAYS)}
+        id_to_idx[s["session_id"]].append(idx)
 
     for idx, s in enumerate(sessions):
         if not s["depends_on"]:
             continue
-        for p_idx in code_to_idx.get(s["depends_on"], []):
-            for opt_i, (day, _, _) in enumerate(session_options[idx]):
-                for p_opt_i, (p_day, _, _) in enumerate(session_options[p_idx]):
-                    if day_index[day] <= day_index[p_day]:
-                        model.AddBoolOr([
-                            choice[(idx, opt_i)].Not(),
-                            choice[(p_idx, p_opt_i)].Not(),
-                        ])
+        for p_idx in id_to_idx.get(s["depends_on"], []):
+            model.Add(day_idx_var[idx] > day_idx_var[p_idx])
+
+    # --- Position rules: evaluated among sessions of the SAME course ---
+    by_course = defaultdict(list)
+    for idx, s in enumerate(sessions):
+        by_course[s["course_code"]].append(idx)
+
+    for course, idxs in by_course.items():
+        if len(idxs) < 2:
+            continue
+        for idx in idxs:
+            rule = sessions[idx]["position_rule"]
+            siblings = [j for j in idxs if j != idx]
+            if rule == "Must be first":
+                for j in siblings:
+                    model.Add(day_idx_var[idx] <= day_idx_var[j])
+            elif rule == "Must be last":
+                for j in siblings:
+                    model.Add(day_idx_var[idx] >= day_idx_var[j])
+            elif rule == "Cannot be first":
+                # at least one sibling must be on the same day or earlier
+                b_vars = []
+                for j in siblings:
+                    b = model.NewBoolVar(f"notfirst_{idx}_{j}")
+                    model.Add(day_idx_var[j] <= day_idx_var[idx]).OnlyEnforceIf(b)
+                    model.Add(day_idx_var[j] > day_idx_var[idx]).OnlyEnforceIf(b.Not())
+                    b_vars.append(b)
+                model.AddBoolOr(b_vars)
+            elif rule == "Cannot be last":
+                b_vars = []
+                for j in siblings:
+                    b = model.NewBoolVar(f"notlast_{idx}_{j}")
+                    model.Add(day_idx_var[j] >= day_idx_var[idx]).OnlyEnforceIf(b)
+                    model.Add(day_idx_var[j] < day_idx_var[idx]).OnlyEnforceIf(b.Not())
+                    b_vars.append(b)
+                model.AddBoolOr(b_vars)
 
     # --- Solve ---
     solver = cp_model.CpSolver()
@@ -212,6 +288,7 @@ def solve_schedule(venues_df, lecturers_df, cohorts_df, courses_df):
             if solver.Value(choice[(idx, opt_i)]):
                 s = sessions[idx]
                 assignments.append({
+                    "session_id": s["session_id"],
                     "course_code": s["course_code"],
                     "group": s["group"],
                     "cohort": s["cohort"],
@@ -221,6 +298,5 @@ def solve_schedule(venues_df, lecturers_df, cohorts_df, courses_df):
                     "venue": room,
                     "start_date": s["start_date"],
                     "end_date": s["end_date"],
-                    "exceptions": s["exceptions"],
                 })
     return {"status": "FEASIBLE", "assignments": assignments}
